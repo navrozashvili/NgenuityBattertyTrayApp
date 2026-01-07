@@ -25,6 +25,8 @@ internal sealed class NgenuityHubClient : IDisposable
     private SubscriberSocket? _sub;
     private CancellationTokenSource? _cts;
     private readonly object _reqLock = new();
+    private int? _connectedReqPort;
+    private int? _connectedSubPort;
 
     public event Action<Notification, ChMessage>? NotificationReceived;
 
@@ -107,62 +109,132 @@ internal sealed class NgenuityHubClient : IDisposable
 
         lock (_reqLock)
         {
-            _req.SendFrame(request);
-            if (_req.TryReceiveFrameBytes(TimeSpan.FromMilliseconds(750), out var resp))
-                return resp;
+            // REQ sockets must strictly alternate Send/Receive. If we ever time out waiting for a reply,
+            // the socket remains in "waiting for reply" state and will throw on the next Send.
+            // To recover we must dispose/recreate the socket.
+            for (var attempt = 0; attempt < 2; attempt++)
+            {
+                try
+                {
+                    if (_req == null)
+                        throw new InvalidOperationException("Ngenuity IPC is not connected.");
+
+                    _req.SendFrame(request);
+                    if (_req.TryReceiveFrameBytes(TimeSpan.FromMilliseconds(750), out var resp) && resp is not null)
+                        return resp;
+
+                    throw new TimeoutException("Timed out waiting for response from ngenuity3-srv-communication-hub.");
+                }
+                catch (Exception ex) when (ex is TimeoutException or NetMQ.FiniteStateMachineException)
+                {
+                    _log.Warn(ex, "IPC request failed; resetting request socket");
+                    ResetRequestSocket_NoLock();
+
+                    // retry once after reset
+                    if (attempt == 0 && _req != null)
+                        continue;
+
+                    throw;
+                }
+            }
         }
 
-        throw new TimeoutException("Timed out waiting for response from ngenuity3-srv-communication-hub.");
+        // Should be unreachable due to throws/returns above.
+        throw new InvalidOperationException("IPC send failed unexpectedly.");
+    }
+
+    private void ResetRequestSocket_NoLock()
+    {
+        try { _req?.Dispose(); } catch { /* ignore */ }
+        _req = null;
+
+        try
+        {
+            _req = ConnectRequestSocket();
+        }
+        catch (Exception ex)
+        {
+            _log.Warn(ex, "IPC request reconnect failed");
+            _req = null;
+        }
     }
 
     private RequestSocket ConnectRequestSocket()
     {
+        if (_connectedReqPort.HasValue)
+        {
+            if (TryConnectRequestSocket(_connectedReqPort.Value, out var preferred))
+                return preferred;
+        }
+
         for (var port = ServerPortStart; port < ServerPortEndExclusive; port++)
         {
-            var socket = new RequestSocket();
-            var addr = $"tcp://localhost:{port}";
-            try
-            {
-                socket.Connect(addr);
-                socket.SendFrame(HxAck);
-                if (socket.TryReceiveFrameBytes(TimeSpan.FromMilliseconds(800), out _))
-                {
-                    _log.Info($"IPC request connected: {addr}");
-                    return socket;
-                }
-            }
-            catch (Exception ex)
-            {
-                _log.Warn($"IPC request connect failed on {addr}: {ex.Message}");
-            }
-
-            try { socket.Dispose(); } catch { /* ignore */ }
+            if (TryConnectRequestSocket(port, out var socket))
+                return socket;
         }
 
         throw new Exception($"No ngenuity communication hub server found on ports {ServerPortStart}-{ServerPortEndExclusive - 1}.");
     }
 
+    private bool TryConnectRequestSocket(int port, out RequestSocket socket)
+    {
+        socket = new RequestSocket();
+        var addr = $"tcp://localhost:{port}";
+        try
+        {
+            socket.Connect(addr);
+            socket.SendFrame(HxAck);
+            if (socket.TryReceiveFrameBytes(TimeSpan.FromMilliseconds(800), out _))
+            {
+                _connectedReqPort = port;
+                _log.Info($"IPC request connected: {addr}");
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"IPC request connect failed on {addr}: {ex.Message}");
+        }
+
+        try { socket.Dispose(); } catch { /* ignore */ }
+        return false;
+    }
+
     private SubscriberSocket ConnectSubscriberSocket()
     {
+        if (_connectedSubPort.HasValue)
+        {
+            if (TryConnectSubscriberSocket(_connectedSubPort.Value, out var preferred))
+                return preferred;
+        }
+
         for (var port = SubscriberPortStart; port < SubscriberPortEndExclusive; port++)
         {
-            var socket = new SubscriberSocket();
-            var addr = $"tcp://localhost:{port}";
-            try
-            {
-                socket.Connect(addr);
-                _log.Info($"IPC subscriber connected: {addr}");
+            if (TryConnectSubscriberSocket(port, out var socket))
                 return socket;
-            }
-            catch (Exception ex)
-            {
-                _log.Warn($"IPC subscriber connect failed on {addr}: {ex.Message}");
-            }
-
-            try { socket.Dispose(); } catch { /* ignore */ }
         }
 
         throw new Exception($"No ngenuity communication hub publisher found on ports {SubscriberPortStart}-{SubscriberPortEndExclusive - 1}.");
+    }
+
+    private bool TryConnectSubscriberSocket(int port, out SubscriberSocket socket)
+    {
+        socket = new SubscriberSocket();
+        var addr = $"tcp://localhost:{port}";
+        try
+        {
+            socket.Connect(addr);
+            _connectedSubPort = port;
+            _log.Info($"IPC subscriber connected: {addr}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"IPC subscriber connect failed on {addr}: {ex.Message}");
+        }
+
+        try { socket.Dispose(); } catch { /* ignore */ }
+        return false;
     }
 
     private void Subscribe(Notification notification)
@@ -218,5 +290,3 @@ internal sealed class NgenuityHubClient : IDisposable
         }, token);
     }
 }
-
-

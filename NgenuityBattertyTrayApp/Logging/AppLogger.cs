@@ -26,6 +26,11 @@ internal sealed class AppLogger : IDisposable
     public void Warn(string message) => Write("WARN", message);
     public void Error(string message) => Write("ERROR", message);
 
+    public void Warn(Exception ex, string message)
+    {
+        Write("WARN", $"{message}{Environment.NewLine}{ex}");
+    }
+
     public void Error(Exception ex, string message)
     {
         Write("ERROR", $"{message}{Environment.NewLine}{ex}");

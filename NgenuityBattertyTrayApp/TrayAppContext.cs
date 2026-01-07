@@ -1,4 +1,5 @@
 using CommunicationHub;
+using NetMQ;
 using NgenuityBattertyTrayApp.Logging;
 using NgenuityBattertyTrayApp.Ngenuity;
 using NgenuityBattertyTrayApp.Settings;
@@ -368,6 +369,13 @@ internal sealed class TrayAppContext : ApplicationContext
                 }
             }
 
+            UpdateTrayDisplay();
+        }
+        catch (Exception ex) when (ex is TimeoutException or NetMQ.FiniteStateMachineException)
+        {
+            // Transient IPC hiccups can happen if NGENUITY is busy/restarting.
+            // These are recoverable; keep the tray UI responsive and avoid scary error spam.
+            _log.Warn(ex, "Polling battery temporarily failed");
             UpdateTrayDisplay();
         }
         catch (Exception ex)
